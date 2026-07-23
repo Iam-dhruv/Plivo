@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Architecture Summary: The Flaky Network</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        h1, h2, h3 {
+            color: #0056b3;
+        }
+        code {
+            background-color: #f4f4f4;
+            padding: 2px 4px;
+            border-radius: 4px;
+            font-family: Consolas, monospace;
+        }
+        .section {
+            margin-bottom: 30px;
+        }
+    </style>
+</head>
+<body>
+
+    <h1>System Architecture and Design Summary</h1>
+    <p>This document details the architectural choices, system-level optimizations, and iterative design process used to construct a resilient, ultra-low latency UDP pipeline for "The Flaky Network" challenge.</p>
+
+    <div class="section">
+        <h2>1. Evolution of the Design</h2>
+        <p>The initial architecture relied on a combination of Forward Error Correction (FEC) and an Automatic Repeat reQuest (ARQ) feedback loop. A dedicated playout thread on the receiver attempted to wake up at exact intervals using <code>clock_nanosleep</code> to deliver frames right at their deadline.</p>
+        <p>This approach was ultimately abandoned due to system-level constraints. Operating system thread schedulers and local network stack traversal introduced micro-stutters, causing packets to arrive microscopically late and resulting in 100% deadline misses. Furthermore, ARQ (NACKs) proved too slow for ultra-low latency targets, as the round-trip time for a retransmission invariably exceeded the tight playout deadlines.</p>
+    </div>
+
+    <div class="section">
+        <h2>2. Sender Architecture: Hybrid Redundancy</h2>
+        <p>To eliminate the need for time-costly retransmissions, the sender was redesigned to proactively push redundancy using a hybrid FEC and duplication model.</p>
+        <ul>
+            <li><strong>FEC Grouping (N=4):</strong> The sender groups frames into blocks of four, computing a bitwise XOR across the payloads. A single parity packet is emitted at the end of the block, capable of mathematically reconstructing any single lost frame within that group.</li>
+            <li><strong>Selective Frame Duplication:</strong> The first two frames of every block (frames 0 and 1) possess the most immediate relative deadlines. Waiting for the parity packet at the end of the block to recover them would introduce too much delay. The sender intercepts these two frames and transmits an immediate, exact duplicate for each.</li>
+            <li><strong>Bandwidth Optimization:</strong> The assignment strictly enforces a &le; 2.0x bandwidth limit. By sending 4 data frames, 2 duplicate frames, and 1 parity frame, the system transmits 7 packets for every 4 frames generated. This yields an overhead ratio of 1.75x, efficiently utilizing the available bandwidth budget to maximize survivability without triggering a penalty.</li>
+        </ul>
+    </div>
+
+    <div class="section">
+        <h2>3. Receiver Architecture: Zero-Jitter Delivery</h2>
+        <p>The receiver was entirely overhauled to remove self-inflicted latency. The fixed-delay playout loop and all reliance on absolute system clocks were completely removed.</p>
+        <ul>
+            <li><strong>Immediate Forwarding:</strong> The moment a valid packet arrives from the network, it is tracked and immediately pushed out to the harness player's socket. This bypasses the OS scheduler entirely, trusting the harness to buffer early arrivals until their official deadline.</li>
+            <li><strong>Exact-Sequence FEC Tracker:</strong> The receiver maintains a small, lightweight state tracker for incoming FEC groups. If a gap is detected and the corresponding parity packet arrives, the missing frame is reconstructed using XOR operations and instantly delivered.</li>
+            <li><strong>Out-of-Order Processing:</strong> By delivering packets as they arrive or are reconstructed, the receiver ensures that slightly delayed or reordered packets count as soon as possible, rather than artificially holding them in a local jitter buffer.</li>
+        </ul>
+    </div>
+
+    <div class="section">
+        <h2>4. System-Level Considerations</h2>
+        <p>In the C implementation, memory ownership and fast execution are critical. The receiver utilizes tightly packed structs (<code>__attribute__((packed))</code>) to ensure the wire format translates directly to memory without padding issues. Network byte order is strictly enforced using <code>htonl</code> and <code>ntohl</code> for multi-byte sequence headers. By shifting the buffering responsibility to the final harness socket and using immediate pass-through, the system avoids complex thread synchronization (mutexes) and memory locks, resulting in a highly performant, lock-free datapath.</p>
+    </div>
+
+</body>
+</html>
