@@ -24,7 +24,7 @@
 #include <unistd.h>
 #include <stdint.h>
 
-#define FEC_N 2
+#define FEC_N 4
 #define TYPE_DATA 0
 #define TYPE_PARITY 1
 
@@ -78,6 +78,10 @@ int main(void) {
             memcpy(pkt.payload, buf + 4, 160);
 
             sendto(out_fd, &pkt, sizeof(pkt), 0, (struct sockaddr *)&relay, sizeof(relay));
+
+            if ((seq % FEC_N) < 2) {
+                sendto(out_fd, &pkt, sizeof(pkt), 0, (struct sockaddr *)&relay, sizeof(relay));
+            }
 
             // Update XOR Parity
             for (int i = 0; i < 160; i++) {

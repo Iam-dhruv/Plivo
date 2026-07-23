@@ -7,98 +7,124 @@
  *                  BEFORE its deadline t0 + DELAY_MS + i*20ms.
  *   send 47003  -> feedback to your sender, via the relay (optional)
  *
- * This baseline forwards whatever arrives straight to the player: lost
- * frames stay lost, late frames stay late, duplicates are re-sent
- * harmlessly. All yours to fix — jitter buffer, reordering, recovery.
- *
- * Env vars available: T0, DURATION_S, DELAY_MS. Harness kills the process
- * at run end; a forever-loop is fine.
+ * This version forwards received frames immediately and reconstructs a
+ * single missing frame per FEC group when parity arrives.
  */
 #include <arpa/inet.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <pthread.h>
-#include <time.h>
-#include <stdint.h>
-#include <errno.h>
 
 #define TYPE_DATA 0
 #define TYPE_PARITY 1
-#define JITTER_SIZE 4096
-#define FEC_GROUPS 1024
+#define SEQ_RING 4096
+#define FEC_GROUPS 2048
+#define MAX_FEC_GROUP 8
 
 typedef struct __attribute__((packed)) {
     uint32_t seq;
     uint32_t send_ms;
-    uint8_t  type;
-    uint8_t  group_size;
+    uint8_t type;
+    uint8_t group_size;
     uint16_t group_base;
-    uint8_t  payload[160];
+    uint8_t payload[160];
 } WirePacket;
 
 typedef struct {
+    uint32_t seq;
     uint8_t present;
+    uint8_t delivered;
     uint8_t payload[160];
-} JitterSlot;
+} FrameSlot;
 
 typedef struct {
-    uint8_t count;
+    uint32_t group_base;
+    uint8_t valid;
     uint8_t parity_present;
-    uint8_t data_xor[160];
-    uint8_t parity_payload[160];
     uint8_t group_size;
+    uint8_t present_mask;
+    uint8_t delivered_mask;
+    uint8_t payloads[MAX_FEC_GROUP][160];
+    uint8_t parity_payload[160];
 } FECState;
 
-JitterSlot buffer[JITTER_SIZE];
-FECState fec_state[FEC_GROUPS];
-pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+static FrameSlot buffer[SEQ_RING];
+static FECState fec_state[FEC_GROUPS];
 
-void* playout_thread(void* arg) {
-    int out_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in player = {0};
-    player.sin_family = AF_INET;
-    player.sin_port = htons(47020);
-    player.sin_addr.s_addr = inet_addr("127.0.0.1");
+static void send_frame(int out_fd, const struct sockaddr_in *player,
+                       uint32_t seq, const uint8_t payload[160]) {
+    unsigned char out_buf[164];
+    uint32_t net_seq = htonl(seq);
+    memcpy(out_buf, &net_seq, 4);
+    memcpy(out_buf + 4, payload, 160);
+    sendto(out_fd, out_buf, sizeof(out_buf), 0,
+           (const struct sockaddr *)player, sizeof(*player));
+}
 
-    const char *t0_env = getenv("T0");
-    if (!t0_env) t0_env = getenv("TO");
-    double t0 = t0_env ? atof(t0_env) : 0.0;
-    
-    int delay_ms = getenv("DELAY_MS") ? atoi(getenv("DELAY_MS")) : 60;
-    uint32_t i = 0;
-    struct timespec ts;
-    
-    for (;;) {
-        double deadline = t0 + (delay_ms / 1000.0) + (i * 0.020);
-        
-        // Guard time reduced to 2ms for tighter tolerances
-        double target_time = deadline - 0.002; 
-        
-        ts.tv_sec = (time_t)target_time;
-        ts.tv_nsec = (long)((target_time - ts.tv_sec) * 1e9);
+static void reset_group(FECState *fs, uint32_t group_base, uint8_t group_size) {
+    memset(fs, 0, sizeof(*fs));
+    fs->group_base = group_base;
+    fs->group_size = group_size;
+    fs->valid = 1;
+}
 
-        int ret = clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &ts, NULL);
-        if (ret != 0 && ret != EINTR) {
-            // Catch-up logic omitted for brevity
-        }
-
-        pthread_mutex_lock(&lock);
-        JitterSlot *slot = &buffer[i % JITTER_SIZE];
-        if (slot->present) {
-            unsigned char out_buf[164];
-            uint32_t net_seq = htonl(i);
-            memcpy(out_buf, &net_seq, 4);
-            memcpy(out_buf + 4, slot->payload, 160);
-            sendto(out_fd, out_buf, 164, 0, (struct sockaddr *)&player, sizeof(player));
-        } 
-        memset(slot, 0, sizeof(JitterSlot));
-        pthread_mutex_unlock(&lock);
-        i++;
+static void deliver_slot(int out_fd, const struct sockaddr_in *player,
+                         uint32_t seq, const uint8_t payload[160]) {
+    FrameSlot *slot = &buffer[seq % SEQ_RING];
+    if (slot->delivered && slot->seq == seq) {
+        return;
     }
-    return NULL;
+    slot->seq = seq;
+    slot->present = 1;
+    slot->delivered = 1;
+    memcpy(slot->payload, payload, 160);
+    send_frame(out_fd, player, seq, payload);
+}
+
+static void try_reconstruct(int out_fd, const struct sockaddr_in *player,
+                            FECState *fs) {
+    if (!fs->valid || !fs->parity_present || fs->group_size == 0) {
+        return;
+    }
+
+    uint8_t missing_index = 255;
+    uint8_t present_count = 0;
+    for (uint8_t i = 0; i < fs->group_size; i++) {
+        uint8_t mask = (uint8_t)(1u << i);
+        if (fs->present_mask & mask) {
+            present_count++;
+        } else if (missing_index == 255) {
+            missing_index = i;
+        } else {
+            return;
+        }
+    }
+
+    if (missing_index == 255 || present_count != (uint8_t)(fs->group_size - 1)) {
+        return;
+    }
+
+    uint8_t recovered[160];
+    memcpy(recovered, fs->parity_payload, 160);
+    for (uint8_t i = 0; i < fs->group_size; i++) {
+        if (i == missing_index) {
+            continue;
+        }
+        for (int j = 0; j < 160; j++) {
+            recovered[j] ^= fs->payloads[i][j];
+        }
+    }
+
+    uint32_t seq = fs->group_base + missing_index;
+    uint8_t mask = (uint8_t)(1u << missing_index);
+    if (fs->delivered_mask & mask) {
+        return;
+    }
+    fs->delivered_mask |= mask;
+    deliver_slot(out_fd, player, seq, recovered);
 }
 
 int main(void) {
@@ -109,63 +135,60 @@ int main(void) {
     in_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
     bind(in_fd, (struct sockaddr *)&in_addr, sizeof(in_addr));
 
+    int out_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in player = {0};
+    player.sin_family = AF_INET;
+    player.sin_port = htons(47020);
+    player.sin_addr.s_addr = inet_addr("127.0.0.1");
+
     memset(buffer, 0, sizeof(buffer));
     memset(fec_state, 0, sizeof(fec_state));
-
-    pthread_t p_thread;
-    pthread_create(&p_thread, NULL, playout_thread, NULL);
 
     WirePacket pkt;
     for (;;) {
         memset(&pkt, 0, sizeof(pkt));
         ssize_t n = recvfrom(in_fd, &pkt, sizeof(pkt), 0, NULL, NULL);
-        if (n < (ssize_t)sizeof(WirePacket)) continue;
+        if (n < (ssize_t)sizeof(WirePacket)) {
+            continue;
+        }
 
         uint32_t seq = ntohl(pkt.seq);
-        uint16_t group_base = ntohs(pkt.group_base);
-        uint8_t n_fec = pkt.group_size;
-        int group_idx = (group_base / n_fec) % FEC_GROUPS;
+        uint32_t group_base = (uint32_t)ntohs(pkt.group_base);
+        uint8_t group_size = pkt.group_size;
+        if (group_size == 0 || group_size > MAX_FEC_GROUP) {
+            continue;
+        }
 
-        pthread_mutex_lock(&lock);
-        
+        int group_idx = (group_base / group_size) % FEC_GROUPS;
+        FECState *fs = &fec_state[group_idx];
+        if (!fs->valid || fs->group_base != group_base || fs->group_size != group_size) {
+            reset_group(fs, group_base, group_size);
+        }
+
         if (pkt.type == TYPE_DATA) {
-            if (!buffer[seq % JITTER_SIZE].present) {
-                buffer[seq % JITTER_SIZE].present = 1;
-                memcpy(buffer[seq % JITTER_SIZE].payload, pkt.payload, 160);
-
-                fec_state[group_idx].count++;
-                fec_state[group_idx].group_size = n_fec;
-                for (int j = 0; j < 160; j++) {
-                    fec_state[group_idx].data_xor[j] ^= pkt.payload[j];
+            if (seq >= group_base) {
+                uint8_t index = (uint8_t)(seq - group_base);
+                if (index < group_size) {
+                    uint8_t mask = (uint8_t)(1u << index);
+                    if (!(fs->present_mask & mask)) {
+                        fs->present_mask |= mask;
+                        memcpy(fs->payloads[index], pkt.payload, 160);
+                        deliver_slot(out_fd, &player, seq, pkt.payload);
+                        fs->delivered_mask |= mask;
+                        try_reconstruct(out_fd, &player, fs);
+                    }
                 }
             }
         } else if (pkt.type == TYPE_PARITY) {
-            fec_state[group_idx].parity_present = 1;
-            fec_state[group_idx].group_size = n_fec;
-            memcpy(fec_state[group_idx].parity_payload, pkt.payload, 160);
+            fs->parity_present = 1;
+            memcpy(fs->parity_payload, pkt.payload, 160);
+            try_reconstruct(out_fd, &player, fs);
         }
 
-        FECState *fs = &fec_state[group_idx];
-        if (fs->parity_present && fs->count == fs->group_size - 1) {
-            for (uint32_t s = group_base; s < group_base + fs->group_size; s++) {
-                if (!buffer[s % JITTER_SIZE].present) {
-                    buffer[s % JITTER_SIZE].present = 1;
-                    for (int j = 0; j < 160; j++) {
-                        buffer[s % JITTER_SIZE].payload[j] = fs->data_xor[j] ^ fs->parity_payload[j];
-                    }
-                    fs->count++;
-                    break;
-                }
-            }
+        if (fs->present_mask == (uint8_t)((1u << group_size) - 1)) {
+            fs->valid = 0;
         }
-
-        if (seq % n_fec == 0) {
-             int stale_idx = ((group_base / n_fec) - 2) % FEC_GROUPS;
-             if (stale_idx >= 0) {
-                 memset(&fec_state[stale_idx], 0, sizeof(FECState));
-             }
-        }
-        pthread_mutex_unlock(&lock);
     }
+
     return 0;
 }
